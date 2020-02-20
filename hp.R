@@ -1,21 +1,21 @@
 library("tidyverse")
 library("caret")
-library("data.table")
-library("gridExtra")
+library("caretEnsemble")
+library("kernlab")
+library("Matrix")
 library("skimr")
 library("recipes")
+library("xgboost")
 
 setwd("C:/Users/Utilizador/Desktop/kaggle/House_Prices-Advanced_Regression_Techniques")
 set.seed(4561)
 
 # Load data
-train <- read.csv('train.csv')
-test <- read.csv('test.csv')
-glimpse(train)
-glimpse(test)
-test$SalePrice <- NA
-hp <- rbind(train, test)
-remove(train); remove(test)
+db1 <- read.csv('train.csv')
+db2 <- read.csv('test.csv')
+db2$SalePrice <- as.integer(NA)
+hp <- rbind(db1, db2)
+remove(db1); remove(db2)
 glimpse(hp)
 skim(hp)
 
@@ -62,6 +62,7 @@ ggplot(hp, aes(x=GrLivArea, y=SalePrice)) +
         xlab("above grade living area") +
         ylab("sale price")
 
+hp <- hp[c(-463,-524,-633,-1299,-1325,-31,-971),]
 
 # Feature engineering
 
@@ -79,7 +80,7 @@ hp <- hp  %>%
                yearsRemodeled = ifelse(YearRemodAdd == YearBuilt, YrSold < YearRemodAdd, 0),
                YrSold = factor(YrSold),
                MoSold = factor(MoSold),
-               totalPorchSF = OpenPorchSF+EnclosedPorch+ThreeSnPorch+ScreenPorch,
+               totalPorchSF = OpenPorchSF + EnclosedPorch + ThreeSnPorch + ScreenPorch,
                withbsmtBath = as.numeric(BsmtHalfBath + BsmtFullBath!=0),
                isBsmtUnf = as.numeric(TotalBsmtSF == BsmtUnfSF)
         )
@@ -106,8 +107,6 @@ model_recipe <- recipe(SalePrice ~ ., data = hp_train) %>%
 
 model_recipe
 
-summary(model_recipe)
-
 ## Preparing the recipe
 prepped_recipe <- prep(model_recipe, training = hp_train)
 prepped_recipe
@@ -124,3 +123,112 @@ qqnorm(train$SalePrice)
 
 
 # Modeling
+
+## Determin the best nRound value (number of iterations) with a xgboost model
+
+params<-list(
+        max_depth = 4, # default=6
+        eta = 0.02, # it lies between 0.01 - 0.3
+        gamma = 0, # default=0
+        colsample_bytree = 0.65, # Typically, its values lie between (0.5,0.9)
+        subsample = 0.6, # Typically, its values lie between (0.5-0.8)
+        min_child_weight = 3 # default=1
+)
+
+# preparing matrix 
+dtrain <- xgb.DMatrix(data = sparse.model.matrix(SalePrice~ .-Id, train), label= train$SalePrice)
+
+# calculate the best nround for this model
+set.seed(2123)
+xgbcv <- xgb.cv( params = params, data = dtrain, label = train$SalePrice, nrounds = 2000, nfold = 10, showsd = F, stratified = T, print_every_n = 250, early_stopping_rounds = 50, maximize = F)
+
+niter <- xgbcv$best_iteration 
+
+# check the most important features
+xgb1 <- xgb.train(data = dtrain, params=params, nrounds = niter)
+mat <- xgb.importance(feature_names = xgb1$feature_names, model = xgb1)
+ggplot(mat[1:40,])+
+        geom_bar(aes(x=reorder(Feature, Gain), y=Gain), stat='identity', fill='red')+
+        xlab(label = "Features")+
+        coord_flip() +
+        ggtitle("Feature Importance")
+
+
+# Caret ensemble model training
+
+set.seed(2123)
+trControl <- trainControl(
+        method='cv',
+        savePredictions="final",
+        index = createFolds(train$SalePrice,k = 10, returnTrain = TRUE),
+        allowParallel =TRUE, 
+        verboseIter = TRUE
+)
+
+xgbGrid <- expand.grid(nrounds = niter, max_depth = c(3,4,5), eta = 0.02, gamma = 0, colsample_bytree = c(0.65),  subsample = c(0.6), min_child_weight = c(3,4,5))
+glmGrid <- expand.grid(alpha = 1, lambda = seq(0.00001,0.01,by = 0.0001))
+svmGrid <- expand.grid(sigma= 2^seq(-11, -16, -0.5), C= 2^seq(4,9,1))
+
+model <<- caretList(
+        x = subset(train, select=-c(Id, SalePrice)),
+        y = train$SalePrice,
+        trControl=trControl,
+        metric="RMSE",
+        tuneList=list(
+                xgb2 = caretModelSpec(method="xgbTree",  tuneGrid = xgbGrid),
+                glm=caretModelSpec(method="glmnet", tuneGrid = glmGrid),
+                svm = caretModelSpec(method="svmRadial", tuneGrid = svmGrid, preProcess=c("nzv", "pca"))
+        )
+)
+
+#  Model performance
+
+## visualize the tuning result 
+## performance of each model 
+## correlation between models
+
+plot(model$xgb2)
+plot(model$glm)
+plot(model$svm)
+bwplot(resamples(model),metric="RMSE")
+modelCor(resamples(model))
+
+# final stacking on the three models
+
+model_Ensemble <- caretEnsemble(   ### equals caretStack (method='glm')
+        model, 
+        metric="RMSE",
+        trControl=trainControl(number=10, method = "repeatedcv", repeats=3)
+)
+summary(model_Ensemble)
+
+
+# Visualize the residuals
+
+#check which data points gave highest prediction errors in our training set. 
+#(The outliers were also spotted at this step)
+
+pred.train <- predict(model_Ensemble, newdata=subset(train, select=-c(Id, SalePrice)))
+hp.plot <- hp %>%
+        filter(!is.na(SalePrice))
+hp.plot$pred <- pred.train
+hp.plot <- hp.plot %>%
+        mutate(residual = log(SalePrice)-pred) 
+
+
+
+ggplot(hp.plot, aes(x = pred, y = residual)) + 
+        geom_pointrange(aes(ymin = 0, ymax = residual)) + 
+        geom_hline(yintercept = 0, linetype = 3) + 
+        geom_text(data = hp.plot[abs(residual) > 0.25,], aes(label = Id), vjust=1.5, col = "red") +
+        ggtitle("Residuals vs. model prediction") +
+        xlab("prediction") +
+        ylab("residual") +
+        theme(text = element_text(size=9)) 
+
+
+# Final prediction 
+
+pred <- predict(model_Ensemble, newdata=subset(test, select=-c(Id, SalePrice)))
+result <- data.frame('Id'= hp_test$Id, 'SalePrice'=exp(pred)) 
+write.csv(result, file="final pred.csv", row.names = F)
