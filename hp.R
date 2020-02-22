@@ -16,13 +16,9 @@ db2 <- read.csv('test.csv')
 db2$SalePrice <- as.integer(NA)
 hp <- rbind(db1, db2)
 remove(db1); remove(db2)
-glimpse(hp)
+
+# Overview of the Data
 skim(hp)
-
-# Changing MSSubClass to a factor
-
-hp <- hp %>%
-        mutate(MSSubClass = factor(MSSubClass))
 
 # Fix variable name starts with number
 
@@ -58,11 +54,12 @@ hp <- hp %>%
 ggplot(hp, aes(x=GrLivArea, y=SalePrice)) +
         geom_point() +
         geom_smooth(method=lm, se=FALSE) +
-        geom_text(data=hp[GrLivArea>4500,], mapping=aes(label=Id), vjust=1.5, col = "blue") +
+        geom_text(data=hp[hp$GrLivArea>4500,], mapping=aes(label=Id), vjust=1.5, col = "blue") +
         xlab("above grade living area") +
         ylab("sale price")
 
-hp <- hp[c(-463,-524,-633,-1299,-1325,-31,-971),]
+outlier <- c(524, 1299, 463, 633, 1325, 31, 971)
+hp<- hp[!hp$Id %in% outlier, ]
 
 # Feature engineering
 
@@ -80,6 +77,9 @@ hp <- hp  %>%
                yearsRemodeled = ifelse(YearRemodAdd == YearBuilt, YrSold < YearRemodAdd, 0),
                YrSold = factor(YrSold),
                MoSold = factor(MoSold),
+               MSSubClass = factor(MSSubClass),
+               OverallQual = factor(OverallQual),
+               OverallCond = factor(OverallCond),
                totalPorchSF = OpenPorchSF + EnclosedPorch + ThreeSnPorch + ScreenPorch,
                withbsmtBath = as.numeric(BsmtHalfBath + BsmtFullBath!=0),
                isBsmtUnf = as.numeric(TotalBsmtSF == BsmtUnfSF)
@@ -88,8 +88,8 @@ hp <- hp  %>%
 # Data preprocessing - Use recipe to do preprocessing
 
 ## split the data
-hp_train <- hp[!is.na(SalePrice),]
-hp_test <- hp[is.na(SalePrice),]
+hp_train <- hp[!is.na(hp$SalePrice),]
+hp_test <- hp[is.na(hp$SalePrice),]
 set.seed(2123)
 
 ## define the recipe
@@ -116,10 +116,11 @@ train <- bake(prepped_recipe, new_data = hp_train)
 test <- bake(prepped_recipe, new_data = hp_test)
 
 
-#Check the data 
+## Check the data 
 anyNA(subset(train, select=-SalePrice))
 
 qqnorm(train$SalePrice)
+qqline(train$SalePrice)
 
 
 # Modeling
@@ -195,7 +196,7 @@ modelCor(resamples(model))
 
 # final stacking on the three models
 
-model_Ensemble <- caretEnsemble(   ### equals caretStack (method='glm')
+model_Ensemble <- caretEnsemble(   
         model, 
         metric="RMSE",
         trControl=trainControl(number=10, method = "repeatedcv", repeats=3)
@@ -220,7 +221,7 @@ hp.plot <- hp.plot %>%
 ggplot(hp.plot, aes(x = pred, y = residual)) + 
         geom_pointrange(aes(ymin = 0, ymax = residual)) + 
         geom_hline(yintercept = 0, linetype = 3) + 
-        geom_text(data = hp.plot[abs(residual) > 0.25,], aes(label = Id), vjust=1.5, col = "red") +
+        geom_text(data = hp.plot[abs(residual) > 0.4,], aes(label = Id), vjust=1.5, col = "red") +
         ggtitle("Residuals vs. model prediction") +
         xlab("prediction") +
         ylab("residual") +

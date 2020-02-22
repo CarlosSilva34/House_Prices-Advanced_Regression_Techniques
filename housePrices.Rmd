@@ -1,0 +1,177 @@
+---
+title: "House Price Prediction"
+author: "Carlos Silva"
+date: "`r format(Sys.Date())`"
+output: 
+   html_document:
+     toc: true
+     number_section: true
+     theme: readable
+     highlight: tango
+     
+---  
+
+# Introduction
+
+## Description
+
+Ask a home buyer to describe their dream house, and they probably won't begin with the height of the basement ceiling or the proximity to an east-west railroad. But this playground competition's dataset proves that much more influences 
+price negotiations than the number of bedrooms or a white-picket fence.
+
+## Objective
+
+With 79 explanatory variables describing (almost) every aspect of residential homes in Ames and Iowa. the goal is to predict the sales price for each house. For each Id in the test set, the model will predict the value of the SalePrice variable. 
+
+# Set up
+
+## Load Packages
+
+```{r setup, include=T, message = F, warning=F}
+require(tidyverse)
+require(skimr)
+require(caret)
+require(caretEnsemble)
+require(xgboost)
+require(kernlab)
+require(Matrix)
+require(recipes)
+```
+
+## Load Datasets
+
+```{r, message = F, warning=F}
+db1 <- read.csv('train.csv')
+db2 <- read.csv('test.csv')
+db2$SalePrice <- as.integer(NA)
+hp <- rbind(db1, db2)
+remove(db1); remove(db2)
+```
+
+# Overview of the Data
+
+```{r}
+skim(hp)
+```
+
+# Data Preparation
+
+## Fix variable name starts with number
+
+```{r}
+names(hp)[44:45] <- c("FirstFLSF","SecFLSF")
+names(hp)[70] <- c("ThreeSnPorch")
+```
+
+## Fix typos in factorial levels
+
+```{r, warning=F}
+count(hp, RoofMatl)
+hp <- hp %>%
+        mutate(RoofMatl = fct_collapse(RoofMatl, "TarGrv" = "Tar&Grv"))
+```
+
+```{r, warning=F}
+count(hp, Exterior1st)
+hp <- hp %>%
+        mutate(Exterior1st = fct_collapse(Exterior1st, "WdSdng" = "Wd Sdng"))
+```
+
+```{r, warning=F}
+count(hp, Exterior2nd)
+hp <- hp %>%
+        mutate(Exterior2nd = fct_collapse(Exterior2nd, "BrkComm" = "Brk Cmn", "WdSdng" = "Wd Sdng", "WdShng" = "Wd Shng"))
+```
+
+## Remove Outliers
+
+we can identify two outlier points (Id = 524, 1299) in this plot SalePrice against GrLivArea, the other outlier points (Id = -463,-633,-1325,-31,-971) were identified after visualize the [residuals](#residuals) plot of the model fitted.
+
+```{r, warning=F}
+ggplot(hp, aes(x=GrLivArea, y=SalePrice)) +
+        geom_point() +
+        geom_smooth(method=lm, se=FALSE) +
+        geom_text(data = hp[hp$GrLivArea>4500,], mapping=aes(label=Id), vjust=1.5, col = "blue") +
+        xlab("above grade living area") +
+        ylab("sale price")
+
+outlier <- c(524, 1299, 463, 633, 1325, 31, 971)
+hp<- hp[!hp$Id %in% outlier, ]
+```
+
+# Feature engineering
+
+Transforming and combining variables to data set.
+
+```{r}
+hp <- hp  %>%
+        mutate(withBsmt = as.numeric(TotalBsmtSF!=0),
+               with2ndFloor= as.numeric(SecFLSF>0),
+               withPool = as.numeric(PoolArea!=0),
+               withPorch = as.numeric((OpenPorchSF+EnclosedPorch+ThreeSnPorch+ScreenPorch)!=0),
+               hasRemod = as.numeric(YearRemodAdd != YearBuilt),
+               withFireplace = as.numeric(Fireplaces >0),
+               isNew = as.numeric(YrSold == YearBuilt),
+               totalSF = GrLivArea + TotalBsmtSF,
+               totalBath = FullBath + 0.5*HalfBath + 0.5*BsmtHalfBath + BsmtFullBath,
+               age = YrSold - YearRemodAdd,
+               yearsRemodeled = ifelse(YearRemodAdd == YearBuilt, YrSold < YearRemodAdd, 0),
+               YrSold = factor(YrSold),
+               MoSold = factor(MoSold),
+               MSSubClass = factor(MSSubClass),
+               OverallQual = factor(OverallQual),
+               OverallCond = factor(OverallCond),
+               totalPorchSF = OpenPorchSF + EnclosedPorch + ThreeSnPorch + ScreenPorch,
+               withbsmtBath = as.numeric(BsmtHalfBath + BsmtFullBath!=0),
+               isBsmtUnf = as.numeric(TotalBsmtSF == BsmtUnfSF)
+        )
+```
+
+# Data preprocessing 
+
+Recipe package was used to do preprocessing
+
+## Split the data
+
+```{r}
+hp_train <- hp[!is.na(hp$SalePrice),]
+hp_test <- hp[is.na(hp$SalePrice),]
+set.seed(2123)
+```
+
+## Define the recipe
+
+```{r, warning=F}
+model_recipe <- recipe(SalePrice ~ ., data = hp_train) %>% 
+        update_role(Id, new_role = "id var") %>%
+        step_knnimpute(all_predictors()) %>%
+        step_dummy(all_predictors(), -all_numeric()) %>%
+        step_BoxCox(all_predictors()) %>%
+        step_center(all_predictors())  %>%
+        step_scale(all_predictors()) %>%
+        step_zv(all_predictors()) %>%
+        step_corr(all_predictors(), threshold = .9) %>%
+        step_log(all_outcomes()) %>%
+        check_missing(all_predictors())
+
+model_recipe
+```
+
+## Preparing and Bake the recipe
+
+```{r, warning=F}
+prepped_recipe <- prep(model_recipe, training = hp_train)
+prepped_recipe
+
+train <- bake(prepped_recipe, new_data = hp_train)
+test <- bake(prepped_recipe, new_data = hp_test)
+```
+
+## Check the data 
+
+```{r}
+anyNA(subset(train, select=-SalePrice))
+
+qqnorm(train$SalePrice)
+qqline(train$SalePrice)
+```
+
