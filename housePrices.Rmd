@@ -142,7 +142,7 @@ set.seed(2123)
 
 ```{r, warning=F}
 model_recipe <- recipe(SalePrice ~ ., data = hp_train) %>% 
-        update_role(Id, new_role = "id var") %>%
+        update_role(Id, new_role = "id variable") %>%
         step_knnimpute(all_predictors()) %>%
         step_dummy(all_predictors(), -all_numeric()) %>%
         step_BoxCox(all_predictors()) %>%
@@ -173,5 +173,134 @@ anyNA(subset(train, select=-SalePrice))
 
 qqnorm(train$SalePrice)
 qqline(train$SalePrice)
+```
+
+# Modeling
+
+Use xgboost model to determin the best nRound value (number of iterations)
+
+```{r}
+params<-list(
+        max_depth = 4, # default=6
+        eta = 0.02, # it lies between 0.01 - 0.3
+        gamma = 0, # default=0
+        colsample_bytree = 0.65, # Typically, its values lie between (0.5,0.9)
+        subsample = 0.6, # Typically, its values lie between (0.5-0.8)
+        min_child_weight = 3 # default=1
+)
+```
+
+## Preparing matrix 
+
+```{r}
+dtrain <- xgb.DMatrix(data = sparse.model.matrix(SalePrice~ .-Id, train), label= train$SalePrice)
+
+```
+
+## Calculate the best nround for this model
+
+```{r}
+set.seed(2123)
+xgbcv <- xgb.cv( params = params, data = dtrain, label = train$SalePrice, nrounds = 2000, nfold = 10, showsd = F, stratified = T, print_every_n = 250, early_stopping_rounds = 50, maximize = F)
+
+niter <- xgbcv$best_iteration
+```
+
+## Check the most important features
+
+```{r}
+xgb1 <- xgb.train(data = dtrain, params=params, nrounds = niter)
+mat <- xgb.importance(feature_names = xgb1$feature_names, model = xgb1)
+ggplot(mat[1:40,])+
+        geom_bar(aes(x=reorder(Feature, Gain), y=Gain), stat='identity', fill='red')+
+        xlab(label = "Features")+
+        coord_flip() +
+        ggtitle("Feature Importance")
+```
+
+## Do caret ensemble model
+
+To make ensemble model were choosed a boosted tree model (xgboost), a regularized linear model (lasso), and a non-linear kernel SVM (svmRadial).
+
+```{r, eval=FALSE, message=FALSE, warning=FALSE}
+set.seed(2123)
+trControl <- trainControl(
+        method='cv',
+        savePredictions="final",
+        index = createFolds(train$SalePrice,k = 10, returnTrain = TRUE),
+        allowParallel =TRUE, 
+        verboseIter = TRUE
+)
+
+xgbGrid <- expand.grid(nrounds = niter, max_depth = c(3,4,5), eta = 0.02, gamma = 0, colsample_bytree = c(0.65),  subsample = c(0.6), min_child_weight = c(3,4,5))
+glmGrid <- expand.grid(alpha = 1, lambda = seq(0.00001,0.01,by = 0.0001))
+svmGrid <- expand.grid(sigma= 2^seq(-11, -16, -0.5), C= 2^seq(4,9,1))
+
+modelList <<- caretList(
+        x = subset(train, select=-c(Id, SalePrice)),
+        y = train$SalePrice,
+        trControl=trControl,
+        metric="RMSE",
+        tuneList=list(
+                xgbTree = caretModelSpec(method="xgbTree",  tuneGrid = xgbGrid),
+                glmnet=caretModelSpec(method="glmnet", tuneGrid = glmGrid),
+                svmRadial = caretModelSpec(method="svmRadial", tuneGrid = svmGrid, preProcess=c("nzv", "pca"))
+        )
+)
+```
+
+# Model performance
+
+## Check the tuning result, performance of each model and correlation between models
+
+```{r}
+plot(modelList$xgbTree)
+plot(modelList$glmnet)
+plot(modelList$svmRadial)
+bwplot(resamples(modelList),metric="RMSE")
+modelCor(resamples(modelList))
+```
+
+## Final stacking on the three models
+
+```{r}
+model_Ensemble <- caretEnsemble(   
+        modelList, 
+        metric="RMSE",
+        trControl=trainControl(number=10, method = "repeatedcv", repeats=3)
+)
+summary(model_Ensemble)
+```
+
+## Check the residuals
+<div id="residuals">
+Visualize which data points gave highest prediction errors in the training set. The outliers were spotted at this step
+
+```{r, warning=F}
+pred.train <- predict(model_Ensemble, newdata=subset(train, select=-c(Id, SalePrice)))
+hp.plot <- hp %>%
+        filter(!is.na(SalePrice))
+hp.plot$pred <- pred.train
+hp.plot <- hp.plot %>%
+        mutate(residual = log(SalePrice)-pred) 
+
+
+
+ggplot(hp.plot, aes(x = pred, y = residual)) + 
+        geom_pointrange(aes(ymin = 0, ymax = residual)) + 
+        geom_hline(yintercept = 0, linetype = 3) + 
+        geom_text(data = hp.plot[abs(hp.plot$residual) > 0.4,], aes(label = Id), vjust=1.5, col = "red") +
+        ggtitle("Residuals vs. model prediction") +
+        xlab("prediction") +
+        ylab("residual") +
+        theme(text = element_text(size=9))
+```
+
+## Final prediction
+
+```{r}
+finalPredictions <- predict(model_Ensemble, newdata=subset(test, select=-c(Id, SalePrice)))
+finalPredictions <- data.frame('Id'= hp_test$Id, 'SalePrice'=exp(finalPredictions)) 
+write.csv(finalPredictions, file="finalpredictions.csv", row.names = F)
 ```
 

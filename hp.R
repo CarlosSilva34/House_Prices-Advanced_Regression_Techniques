@@ -4,7 +4,7 @@ library("caretEnsemble")
 library("kernlab")
 library("Matrix")
 library("skimr")
-library("recipes")
+
 library("xgboost")
 
 setwd("C:/Users/Utilizador/Desktop/kaggle/House_Prices-Advanced_Regression_Techniques")
@@ -121,7 +121,7 @@ anyNA(subset(train, select=-SalePrice))
 
 qqnorm(train$SalePrice)
 qqline(train$SalePrice)
-
+#skim(train)
 
 # Modeling
 
@@ -170,15 +170,15 @@ xgbGrid <- expand.grid(nrounds = niter, max_depth = c(3,4,5), eta = 0.02, gamma 
 glmGrid <- expand.grid(alpha = 1, lambda = seq(0.00001,0.01,by = 0.0001))
 svmGrid <- expand.grid(sigma= 2^seq(-11, -16, -0.5), C= 2^seq(4,9,1))
 
-model <<- caretList(
+modelList <<- caretList(
         x = subset(train, select=-c(Id, SalePrice)),
         y = train$SalePrice,
         trControl=trControl,
         metric="RMSE",
         tuneList=list(
-                xgb2 = caretModelSpec(method="xgbTree",  tuneGrid = xgbGrid),
-                glm=caretModelSpec(method="glmnet", tuneGrid = glmGrid),
-                svm = caretModelSpec(method="svmRadial", tuneGrid = svmGrid, preProcess=c("nzv", "pca"))
+                xgbTree = caretModelSpec(method="xgbTree",  tuneGrid = xgbGrid),
+                glmnet=caretModelSpec(method="glmnet", tuneGrid = glmGrid),
+                svmRadial = caretModelSpec(method="svmRadial", tuneGrid = svmGrid, preProcess=c("nzv", "pca"))
         )
 )
 
@@ -188,26 +188,23 @@ model <<- caretList(
 ## performance of each model 
 ## correlation between models
 
-plot(model$xgb2)
-plot(model$glm)
-plot(model$svm)
-bwplot(resamples(model),metric="RMSE")
-modelCor(resamples(model))
+plot(modelList$xgbTree)
+plot(modelList$glmnet)
+plot(modelList$svmRadial)
+bwplot(resamples(modelList),metric="RMSE")
+modelCor(resamples(modelList))
 
-# final stacking on the three models
+# Final stacking on the three models
 
 model_Ensemble <- caretEnsemble(   
-        model, 
+        modelList, 
         metric="RMSE",
         trControl=trainControl(number=10, method = "repeatedcv", repeats=3)
 )
 summary(model_Ensemble)
 
 
-# Visualize the residuals
-
-#check which data points gave highest prediction errors in our training set. 
-#(The outliers were also spotted at this step)
+# Check the residuals
 
 pred.train <- predict(model_Ensemble, newdata=subset(train, select=-c(Id, SalePrice)))
 hp.plot <- hp %>%
@@ -221,7 +218,7 @@ hp.plot <- hp.plot %>%
 ggplot(hp.plot, aes(x = pred, y = residual)) + 
         geom_pointrange(aes(ymin = 0, ymax = residual)) + 
         geom_hline(yintercept = 0, linetype = 3) + 
-        geom_text(data = hp.plot[abs(residual) > 0.4,], aes(label = Id), vjust=1.5, col = "red") +
+        geom_text(data = hp.plot[abs(hp.plot$residual) > 0.4,], aes(label = Id), vjust=1.5, col = "red") +
         ggtitle("Residuals vs. model prediction") +
         xlab("prediction") +
         ylab("residual") +
@@ -230,6 +227,6 @@ ggplot(hp.plot, aes(x = pred, y = residual)) +
 
 # Final prediction 
 
-pred <- predict(model_Ensemble, newdata=subset(test, select=-c(Id, SalePrice)))
-result <- data.frame('Id'= hp_test$Id, 'SalePrice'=exp(pred)) 
-write.csv(result, file="final pred.csv", row.names = F)
+finalPredictions <- predict(model_Ensemble, newdata=subset(test, select=-c(Id, SalePrice)))
+finalPredictions <- data.frame('Id'= hp_test$Id, 'SalePrice'=exp(finalPredictions)) 
+write.csv(finalPredictions, file="finalpredictions.csv", row.names = F)
